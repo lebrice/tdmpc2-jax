@@ -1,4 +1,4 @@
-from typing import *
+from typing import Literal, Mapping, overload
 
 import jax
 import numpy as np
@@ -6,7 +6,7 @@ import numpy as np
 # TODO: Reuse the buffers from soem other library?
 
 
-class SequentialReplayBuffer[T: dict]:
+class SequentialReplayBuffer[T: Mapping]:
     def __init__(
         self,
         capacity: int,
@@ -46,7 +46,7 @@ class SequentialReplayBuffer[T: dict]:
         )
         self.np_random = np.random.default_rng(seed=seed)
 
-    def insert(self, data: T, mask: Optional[np.ndarray] = None) -> None:
+    def insert(self, data: T, mask: np.ndarray | None = None) -> None:
         """
         Insert data into the buffer
 
@@ -76,6 +76,21 @@ class SequentialReplayBuffer[T: dict]:
         self.current_ind[mask] = (self.current_ind[mask] + 1) % self.capacity
         self.size[mask] = np.clip(self.size[mask] + 1, 0, self.capacity)
 
+    @overload
+    def sample(
+        self,
+        batch_size: int,
+        sequence_length: int,
+        return_inds: Literal[False] = False,
+    ) -> T: ...
+
+    @overload
+    def sample(
+        self,
+        batch_size: int,
+        sequence_length: int,
+        return_inds: Literal[True],
+    ) -> tuple[T, tuple[np.ndarray]]: ...
     def sample(
         self,
         batch_size: int,

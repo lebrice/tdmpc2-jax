@@ -1,6 +1,7 @@
 import os
 from collections import defaultdict
 from functools import partial
+from typing import Sequence, SupportsFloat, TypedDict
 
 import flax.linen as nn
 import gymnasium as gym
@@ -35,7 +36,7 @@ def train(cfg: DictConfig):
     encoder_config = cfg["encoder"]
     model_config = cfg["world_model"]
     tdmpc_config = cfg["tdmpc2"]
-    seed = cfg["seed"]
+    seed: int = cfg["seed"]
 
     ##############################
     # Logger setup
@@ -69,8 +70,8 @@ def train(cfg: DictConfig):
             for seed in range(cfg.seed, cfg.seed + env_config.num_envs)
         ]
     )
-    np.random.seed(cfg["seed"])
-    rng = jax.random.PRNGKey(cfg["seed"])
+    np.random.seed(seed)
+    rng = jax.random.PRNGKey(seed)
 
     ##############################
     # Agent setup
@@ -104,7 +105,7 @@ def train(cfg: DictConfig):
         capacity=cfg.buffer_size,
         vectorized=True,
         num_envs=env_config.num_envs,
-        seed=cfg["seed"],
+        seed=seed,
         dummy_input=dict(
             observation=dummy_obs,
             action=dummy_action,
@@ -180,7 +181,7 @@ def train(cfg: DictConfig):
         ep_count = np.zeros(env_config.num_envs, dtype=int)
         prev_logged_step = global_step
         plan = None
-        observation, _ = env.reset(seed=cfg["seed"])
+        observation, _ = env.reset(seed=seed)
 
         T = 500
         seed_steps = int(max(5 * T, 1000) * env_config.num_envs * env_config.utd_ratio)
@@ -221,8 +222,9 @@ def train(cfg: DictConfig):
 
             if log_this_step:
                 for k, v in all_train_info.items():
-                    writer.add_scalar(f"train/{k}_mean", jnp.mean(v), global_step)
-                    writer.add_scalar(f"train/{k}_std", jnp.std(v), global_step)
+                    v = np.asarray(v)
+                    writer.add_scalar(f"train/{k}_mean", np.mean(v), global_step)
+                    writer.add_scalar(f"train/{k}_std", np.std(v), global_step)
                 #     pass
             # pbar.update(env_config.num_envs)
         pbar.close()
@@ -231,7 +233,9 @@ def train(cfg: DictConfig):
 def make_env(env_config: DictConfig, seed: int):
     def make_gym_env(env_id, seed):
         env = gym.make(env_id)
-        env = gym.wrappers.RescaleAction(env, min_action=-1, max_action=1)
+        env = gym.wrappers.RescaleAction(
+            env, min_action=np.array(-1), max_action=np.array(1.0)
+        )
         env = gym.wrappers.RecordEpisodeStatistics(env)
         env = gym.wrappers.Autoreset(env)
         env.action_space.seed(seed)
@@ -239,7 +243,15 @@ def make_env(env_config: DictConfig, seed: int):
         return env
 
     if env_config.backend == "gymnasium":
-        return make_gym_env(env_config.env_id, seed)
+        env_id = env_config.env_id
+        env = gym.make(env_id)
+        env = gym.wrappers.RescaleAction(env, min_action=-1, max_action=1)  # type: ignore
+        env = gym.wrappers.RecordEpisodeStatistics(env)
+        env = gym.wrappers.Autoreset(env)
+        env.action_space.seed(seed)
+        env.observation_space.seed(seed)
+        return env
+        # return make_gym_env(env_config.env_id, seed)
     elif env_config.backend == "dmc":
         from tdmpc2_jax.envs.dmcontrol import make_dmc_env
 
@@ -253,6 +265,15 @@ def make_env(env_config: DictConfig, seed: int):
         raise ValueError("Environment not supported:", env_config)
 
 
+class Transition[O](TypedDict):
+    observation: O
+    action: np.ndarray
+    reward: SupportsFloat
+    next_observation: O
+    terminated: bool
+    truncated: bool
+
+
 def step[ObsType](
     rng: jax.Array,
     global_step: int,
@@ -262,7 +283,7 @@ def step[ObsType](
     observation: ObsType,
     plan: tuple[jax.Array, jax.Array],
     done: np.ndarray,
-    replay_buffer: SequentialReplayBuffer,
+    replay_buffer: SequentialReplayBuffer[Transition[ObsType]],
     env_config: DictConfig,
     ep_count: np.ndarray,
     log_this_step: bool,
@@ -285,7 +306,7 @@ def step[ObsType](
 
     if np.any(~done):
         replay_buffer.insert(
-            dict(
+            Transition(
                 observation=observation,
                 action=action,
                 reward=reward,
@@ -331,7 +352,6 @@ def step[ObsType](
                 for _ in range(num_updates)
             ]
         )
-
         agent, all_train_info = updates(agent, samples, jax.numpy.stack(update_keys))
 
         # for iupdate in range(num_updates):
@@ -348,7 +368,7 @@ def step[ObsType](
         #     )
         #     if log_this_step:
         #         for k, v in train_info.items():
-        #             all_train_info[k].append(np.array(v))
+        #             all_train_info[k].append(jnp.array(v))
     return rng, agent, observation, plan, done, replay_buffer, all_train_info
 
 
@@ -378,7 +398,7 @@ def update(agent: TDMPC2, batch_and_key: tuple[dict, jax.Array]):
     return next_agent, train_info
 
 
-def tree_stack(trees):
+def tree_stack[T](trees: Sequence[T]) -> T:
     """
     Takes a list of trees and stacks every corresponding leaf.
     For example, given two trees ((a, b), c) and ((a', b'), c'), returns
