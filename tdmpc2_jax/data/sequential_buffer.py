@@ -2,16 +2,15 @@ from typing import *
 
 import jax
 import numpy as np
-from jaxtyping import PyTree
 
 # TODO: Reuse the buffers from soem other library?
 
 
-class SequentialReplayBuffer:
+class SequentialReplayBuffer[T: dict]:
     def __init__(
         self,
         capacity: int,
-        dummy_input: dict,
+        dummy_input: T,
         num_envs: int = 1,
         vectorized: bool = False,
         seed: int | None = None,
@@ -47,7 +46,7 @@ class SequentialReplayBuffer:
         )
         self.np_random = np.random.default_rng(seed=seed)
 
-    def insert(self, data: PyTree, mask: Optional[np.ndarray] = None) -> None:
+    def insert(self, data: T, mask: Optional[np.ndarray] = None) -> None:
         """
         Insert data into the buffer
 
@@ -82,7 +81,7 @@ class SequentialReplayBuffer:
         batch_size: int,
         sequence_length: int,
         return_inds: bool = False,
-    ) -> Union[PyTree, Tuple[PyTree, Tuple[np.ndarray]]]:
+    ) -> T | tuple[T, tuple[np.ndarray]]:
         """
         Sample a batch of sequences from the buffer.
 
@@ -111,7 +110,7 @@ class SequentialReplayBuffer:
         else:
             return batch
 
-    def _sample(self, batch_size: int, sequence_length: int) -> PyTree:
+    def _sample(self, batch_size: int, sequence_length: int) -> tuple[T, np.ndarray]:
         # Sample envs and start indices
         start_inds = self.np_random.integers(
             low=0,
@@ -130,7 +129,9 @@ class SequentialReplayBuffer:
 
         return batch, (sequence_inds)
 
-    def _sample_vectorized(self, batch_size: int, sequence_length: int) -> PyTree:
+    def _sample_vectorized(
+        self, batch_size: int, sequence_length: int
+    ) -> tuple[T, tuple[np.ndarray, np.ndarray]]:
         # Sample envs and start indices
         env_inds = self.np_random.integers(low=0, high=self.num_envs, size=batch_size)
         start_inds = self.np_random.integers(
@@ -154,14 +155,14 @@ class SequentialReplayBuffer:
 
         return batch, (env_inds, sequence_inds)
 
-    def get_state(self) -> Dict:
+    def get_state(self) -> dict:
         return {
             "current_ind": self.current_ind,
             "size": self.size,
             "data": self.data,
         }
 
-    def restore(self, state: Dict) -> None:
+    def restore(self, state: dict) -> None:
         self.current_ind = state["current_ind"]
         self.size = state["size"]
         self.data = state["data"]
