@@ -12,7 +12,9 @@ import optax
 import orbax.checkpoint as ocp
 import tqdm
 from flax.training.train_state import TrainState
-from omegaconf import DictConfig
+from gymnasium import Env
+from omegaconf import DictConfig, OmegaConf
+from tensorboardX import SummaryWriter
 
 from tdmpc2_jax import TDMPC2, WorldModel
 from tdmpc2_jax.common.activations import mish
@@ -41,8 +43,10 @@ def train(cfg: DictConfig):
     import hydra.core.hydra_config
 
     output_dir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
-    # writer = tensorboard.SummaryWriter(os.path.join(output_dir, "tensorboard"))
-    # writer.hparams(cfg)
+    writer = SummaryWriter(os.path.join(output_dir, "tensorboard"))
+    config_dict = OmegaConf.to_container(cfg)
+    assert isinstance(config_dict, dict)
+    writer.add_hparams(config_dict, {})
 
     ##############################
     # Environment setup
@@ -52,30 +56,6 @@ def train(cfg: DictConfig):
     # env_name = "Go1JoystickFlatTerrain"
     # env = registry.load(env_name)
     # env_cfg = registry.get_default_config(env_name)
-
-    def make_env(env_config: DictConfig, seed: int):
-        def make_gym_env(env_id, seed):
-            env = gym.make(env_id)
-            env = gym.wrappers.RescaleAction(env, min_action=-1, max_action=1)
-            env = gym.wrappers.RecordEpisodeStatistics(env)
-            env = gym.wrappers.Autoreset(env)
-            env.action_space.seed(seed)
-            env.observation_space.seed(seed)
-            return env
-
-        if env_config.backend == "gymnasium":
-            return make_gym_env(env_config.env_id, seed)
-        elif env_config.backend == "dmc":
-            from tdmpc2_jax.envs.dmcontrol import make_dmc_env
-
-            env = make_dmc_env(env_config.env_id, seed, env_config.dmc.obs_type)
-            env = gym.wrappers.RecordEpisodeStatistics(env)
-            env = gym.wrappers.Autoreset(env)
-            env.action_space.seed(seed)
-            env.observation_space.seed(seed)
-            return env
-        else:
-            raise ValueError("Environment not supported:", env_config)
 
     # TODO: Use a vmapped environment from mujoco-playground!
 
@@ -146,6 +126,7 @@ def train(cfg: DictConfig):
     )
 
     model = WorldModel.create(
+        # TODO: Use the flatten_space or similar utility fn from gym instead of hard-coding action space type.
         action_dim=np.prod(env.single_action_space.shape),
         encoder=encoder,
         **model_config,
@@ -203,13 +184,17 @@ def train(cfg: DictConfig):
 
         T = 500
         seed_steps = int(max(5 * T, 1000) * env_config.num_envs * env_config.utd_ratio)
-        pbar = tqdm.tqdm(initial=global_step, total=cfg.max_steps)
+        pbar = tqdm.tqdm(
+            range(global_step, cfg.max_steps, env_config.num_envs),
+            unit_scale=env_config.num_envs,
+            unit="Env steps",
+        )
         done = np.zeros(env_config.num_envs, dtype=bool)
-        for global_step in range(global_step, cfg.max_steps, env_config.num_envs):
+        for global_step in pbar:
             log_this_step = global_step >= prev_logged_step + cfg["log_interval_steps"]
             if log_this_step:
                 prev_logged_step = global_step
-            agent, observation, plan, done, replay_buffer, rng, all_train_info = step(
+            rng, agent, observation, plan, done, replay_buffer, all_train_info = step(
                 rng,
                 global_step=global_step,
                 seed_steps=seed_steps,
@@ -235,17 +220,37 @@ def train(cfg: DictConfig):
             )
 
             if log_this_step:
-                # all_train_info
-                pass
-                # for k, v in all_train_info.items():
-                #     # writer.scalar(f"train/{k}_mean", np.mean(v), global_step)
-                #     # writer.scalar(f"train/{k}_std", np.std(v), global_step)
+                for k, v in all_train_info.items():
+                    writer.add_scalar(f"train/{k}_mean", jnp.mean(v), global_step)
+                    writer.add_scalar(f"train/{k}_std", jnp.std(v), global_step)
                 #     pass
-            pbar.update(env_config.num_envs)
+            # pbar.update(env_config.num_envs)
         pbar.close()
 
 
-from gymnasium import Env
+def make_env(env_config: DictConfig, seed: int):
+    def make_gym_env(env_id, seed):
+        env = gym.make(env_id)
+        env = gym.wrappers.RescaleAction(env, min_action=-1, max_action=1)
+        env = gym.wrappers.RecordEpisodeStatistics(env)
+        env = gym.wrappers.Autoreset(env)
+        env.action_space.seed(seed)
+        env.observation_space.seed(seed)
+        return env
+
+    if env_config.backend == "gymnasium":
+        return make_gym_env(env_config.env_id, seed)
+    elif env_config.backend == "dmc":
+        from tdmpc2_jax.envs.dmcontrol import make_dmc_env
+
+        env = make_dmc_env(env_config.env_id, seed, env_config.dmc.obs_type)
+        env = gym.wrappers.RecordEpisodeStatistics(env)
+        env = gym.wrappers.Autoreset(env)
+        env.action_space.seed(seed)
+        env.observation_space.seed(seed)
+        return env
+    else:
+        raise ValueError("Environment not supported:", env_config)
 
 
 def step[ObsType](
@@ -255,7 +260,7 @@ def step[ObsType](
     env: Env[ObsType, np.ndarray],
     agent: TDMPC2,
     observation: ObsType,
-    plan: tuple[jax.Array, ...],
+    plan: tuple[jax.Array, jax.Array],
     done: np.ndarray,
     replay_buffer: SequentialReplayBuffer,
     env_config: DictConfig,
@@ -318,22 +323,68 @@ def step[ObsType](
 
         rng, *update_keys = jax.random.split(rng, num_updates + 1)
 
-        for iupdate in range(num_updates):
-            batch = replay_buffer.sample(agent.batch_size, agent.horizon)
-            assert isinstance(batch, dict)
-            agent, train_info = agent.update(
-                observations=batch["observation"],
-                actions=batch["action"],
-                rewards=batch["reward"],
-                next_observations=batch["next_observation"],
-                terminated=batch["terminated"],
-                truncated=batch["truncated"],
-                key=update_keys[iupdate],
-            )
-            if log_this_step:
-                for k, v in train_info.items():
-                    all_train_info[k].append(np.array(v))
-    return agent, observation, plan, done, replay_buffer, rng, all_train_info
+        # IDEA: Sample all the batches, and pass those to a jitted + scanned update function.
+
+        samples = tree_stack(
+            [
+                replay_buffer.sample(agent.batch_size, agent.horizon)
+                for _ in range(num_updates)
+            ]
+        )
+
+        agent, all_train_info = updates(agent, samples, jax.numpy.stack(update_keys))
+
+        # for iupdate in range(num_updates):
+        #     batch = replay_buffer.sample(agent.batch_size, agent.horizon)
+        #     assert isinstance(batch, dict)
+        #     agent, train_info = agent.update(
+        #         observations=batch["observation"],
+        #         actions=batch["action"],
+        #         rewards=batch["reward"],
+        #         next_observations=batch["next_observation"],
+        #         terminated=batch["terminated"],
+        #         truncated=batch["truncated"],
+        #         key=update_keys[iupdate],
+        #     )
+        #     if log_this_step:
+        #         for k, v in train_info.items():
+        #             all_train_info[k].append(np.array(v))
+    return rng, agent, observation, plan, done, replay_buffer, all_train_info
+
+
+@jax.jit
+def updates(agent: TDMPC2, samples: jax.Array, update_keys: jax.Array):
+    agent, all_train_info = jax.lax.scan(
+        update,
+        init=agent,
+        xs=(samples, jax.numpy.stack(update_keys)),
+        # length=num_updates,
+    )
+    return agent, all_train_info
+
+
+@jax.jit
+def update(agent: TDMPC2, batch_and_key: tuple[dict, jax.Array]):
+    batch, key = batch_and_key
+    next_agent, train_info = agent.update(
+        observations=batch["observation"],
+        actions=batch["action"],
+        rewards=batch["reward"],
+        next_observations=batch["next_observation"],
+        terminated=batch["terminated"],
+        truncated=batch["truncated"],
+        key=key,
+    )
+    return next_agent, train_info
+
+
+def tree_stack(trees):
+    """
+    Takes a list of trees and stacks every corresponding leaf.
+    For example, given two trees ((a, b), c) and ((a', b'), c'), returns
+    ((stack(a, a'), stack(b, b')), stack(c, c')).
+    """
+    return jax.tree.map(lambda *leaves: jnp.stack(leaves), *trees)
 
 
 if __name__ == "__main__":

@@ -16,6 +16,7 @@ dependencies = [
     "orbax-checkpoint>=0.11.32",
     # "tensorboard>=2.20.0",
     # "tensorflow>=2.20.0",
+    "tensorboardx>=2.6.4",
     "tqdm>=4.67.3",
     # "distrax>=0.1.7",
     # NOTE: Distrax does a poor job of listing the fact that it actually depends on tensorflow-probability, which itself does a terrible job and
@@ -23,7 +24,10 @@ dependencies = [
     # "tensorflow-probability>=0.25.0",
     # "tf-keras>=2.20.1",
     # "dm-env>=1.6",
-    # "dm-control>=0.0.319497192",
+    # "dm-control>=0.0.319497192",\
+    # TODO: Look into mujoco-playground for the environment.
+    # "mujoco-warp>=0.0.2",
+    "playground>=0.1.0",
 ]
 
 [tool.uv]
