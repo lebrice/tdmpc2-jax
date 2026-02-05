@@ -10,33 +10,36 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import orbax.checkpoint as ocp
-
-# Tensorboard: Prevent tf from allocating full GPU memory
 import tqdm
-
-# from flax.metrics import tensorboard
 from flax.training.train_state import TrainState
+from omegaconf import DictConfig
 
 from tdmpc2_jax import TDMPC2, WorldModel
 from tdmpc2_jax.common.activations import mish
 from tdmpc2_jax.data import SequentialReplayBuffer
 from tdmpc2_jax.networks import NormedLinear
 
+# from flax.metrics import tensorboard
+# Tensorboard: Prevent tf from allocating full GPU memory
 # gpus = tf.config.experimental.list_physical_devices('GPU')
 # for gpu in gpus:
 #   tf.config.experimental.set_memory_growth(gpu, True)
+# jax.config.update("XLA_PYTHON_CLIENT_PREALLOCATE", False)
 
 
 @hydra.main(config_name="config", config_path=".", version_base=None)
-def train(cfg: dict):
+def train(cfg: DictConfig):
     env_config = cfg["env"]
     encoder_config = cfg["encoder"]
     model_config = cfg["world_model"]
     tdmpc_config = cfg["tdmpc2"]
+    seed = cfg["seed"]
 
     ##############################
     # Logger setup
     ##############################
+    import hydra.core.hydra_config
+
     output_dir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
     # writer = tensorboard.SummaryWriter(os.path.join(output_dir, "tensorboard"))
     # writer.hparams(cfg)
@@ -44,7 +47,13 @@ def train(cfg: dict):
     ##############################
     # Environment setup
     ##############################
-    def make_env(env_config, seed):
+
+    # from mujoco_playground import registry
+    # env_name = "Go1JoystickFlatTerrain"
+    # env = registry.load(env_name)
+    # env_cfg = registry.get_default_config(env_name)
+
+    def make_env(env_config: DictConfig, seed: int):
         def make_gym_env(env_id, seed):
             env = gym.make(env_id)
             env = gym.wrappers.RescaleAction(env, min_action=-1, max_action=1)
@@ -68,6 +77,8 @@ def train(cfg: dict):
         else:
             raise ValueError("Environment not supported:", env_config)
 
+    # TODO: Use a vmapped environment from mujoco-playground!
+
     if env_config.asynchronous:
         vector_env_cls = gym.vector.AsyncVectorEnv
     else:
@@ -78,8 +89,8 @@ def train(cfg: dict):
             for seed in range(cfg.seed, cfg.seed + env_config.num_envs)
         ]
     )
-    np.random.seed(cfg.seed)
-    rng = jax.random.PRNGKey(cfg.seed)
+    np.random.seed(cfg["seed"])
+    rng = jax.random.PRNGKey(cfg["seed"])
 
     ##############################
     # Agent setup
@@ -113,7 +124,7 @@ def train(cfg: dict):
         capacity=cfg.buffer_size,
         vectorized=True,
         num_envs=env_config.num_envs,
-        seed=cfg.seed,
+        seed=cfg["seed"],
         dummy_input=dict(
             observation=dummy_obs,
             action=dummy_action,
@@ -188,109 +199,141 @@ def train(cfg: dict):
         ep_count = np.zeros(env_config.num_envs, dtype=int)
         prev_logged_step = global_step
         plan = None
-        observation, _ = env.reset(seed=cfg.seed)
+        observation, _ = env.reset(seed=cfg["seed"])
 
         T = 500
         seed_steps = int(max(5 * T, 1000) * env_config.num_envs * env_config.utd_ratio)
         pbar = tqdm.tqdm(initial=global_step, total=cfg.max_steps)
         done = np.zeros(env_config.num_envs, dtype=bool)
         for global_step in range(global_step, cfg.max_steps, env_config.num_envs):
-            if global_step <= seed_steps:
-                action = env.action_space.sample()
-            else:
-                rng, action_key = jax.random.split(rng)
-                action, plan = agent.act(
-                    observation,
-                    prev_plan=plan,
-                    deterministic=False,
-                    train=True,
-                    key=action_key,
-                )
-                action = np.array(action)
+            log_this_step = global_step >= prev_logged_step + cfg["log_interval_steps"]
+            if log_this_step:
+                prev_logged_step = global_step
+            agent, observation, plan, done, replay_buffer, rng, all_train_info = step(
+                rng,
+                global_step=global_step,
+                seed_steps=seed_steps,
+                env=env,
+                agent=agent,
+                observation=observation,
+                plan=plan,
+                done=done,
+                replay_buffer=replay_buffer,
+                env_config=env_config,
+                ep_count=ep_count,
+                cfg=cfg,
+                log_this_step=log_this_step,
+            )
 
-            next_observation, reward, terminated, truncated, info = env.step(action)
+            mngr.save(
+                global_step,
+                args=ocp.args.Composite(
+                    agent=ocp.args.StandardSave(agent),
+                    global_step=ocp.args.JsonSave(global_step),
+                    buffer_state=ocp.args.StandardSave(replay_buffer.get_state()),
+                ),
+            )
 
-            if np.any(~done):
-                replay_buffer.insert(
-                    dict(
-                        observation=observation,
-                        action=action,
-                        reward=reward,
-                        next_observation=next_observation,
-                        terminated=terminated,
-                        truncated=truncated,
-                    ),
-                    mask=~done,
-                )
-            observation = next_observation
-
-            # Handle terminations/truncations
-            done = np.logical_or(terminated, truncated)
-            if np.any(done):
-                if plan is not None:
-                    plan = (
-                        plan[0].at[done].set(0),
-                        plan[1].at[done].set(agent.max_plan_std),
-                    )
-                for ienv in range(env_config.num_envs):
-                    if done[ienv]:
-                        r = info["episode"]["r"][ienv]
-                        l = info["episode"]["l"][ienv]
-                        print(f"Episode {ep_count[ienv]}: r = {r:.2f}, l = {l}")
-                        # writer.scalar("episode/return", r, global_step + ienv)
-                        # writer.scalar("episode/length", l, global_step + ienv)
-                        ep_count[ienv] += 1
-
-            if global_step >= seed_steps:
-                if global_step == seed_steps:
-                    print("Pre-training on seed data...")
-                    num_updates = seed_steps
-                else:
-                    num_updates = max(
-                        1, int(env_config.num_envs * env_config.utd_ratio)
-                    )
-
-                rng, *update_keys = jax.random.split(rng, num_updates + 1)
-                log_this_step = (
-                    global_step >= prev_logged_step + cfg["log_interval_steps"]
-                )
-                if log_this_step:
-                    all_train_info = defaultdict(list)
-                    prev_logged_step = global_step
-
-                for iupdate in range(num_updates):
-                    batch = replay_buffer.sample(agent.batch_size, agent.horizon)
-                    agent, train_info = agent.update(
-                        observations=batch["observation"],
-                        actions=batch["action"],
-                        rewards=batch["reward"],
-                        next_observations=batch["next_observation"],
-                        terminated=batch["terminated"],
-                        truncated=batch["truncated"],
-                        key=update_keys[iupdate],
-                    )
-
-                    if log_this_step:
-                        for k, v in train_info.items():
-                            all_train_info[k].append(np.array(v))
-
-                if log_this_step:
-                    for k, v in all_train_info.items():
-                        # writer.scalar(f"train/{k}_mean", np.mean(v), global_step)
-                        # writer.scalar(f"train/{k}_std", np.std(v), global_step)
-                        pass
-
-                mngr.save(
-                    global_step,
-                    args=ocp.args.Composite(
-                        agent=ocp.args.StandardSave(agent),
-                        global_step=ocp.args.JsonSave(global_step),
-                        buffer_state=ocp.args.StandardSave(replay_buffer.get_state()),
-                    ),
-                )
-
+            if log_this_step:
+                # all_train_info
+                pass
+                # for k, v in all_train_info.items():
+                #     # writer.scalar(f"train/{k}_mean", np.mean(v), global_step)
+                #     # writer.scalar(f"train/{k}_std", np.std(v), global_step)
+                #     pass
             pbar.update(env_config.num_envs)
         pbar.close()
+
+
+from gymnasium import Env
+
+
+def step[ObsType](
+    rng: jax.Array,
+    global_step: int,
+    seed_steps: int,
+    env: Env[ObsType, np.ndarray],
+    agent: TDMPC2,
+    observation: ObsType,
+    plan: tuple[jax.Array, ...],
+    done: np.ndarray,
+    replay_buffer: SequentialReplayBuffer,
+    env_config: DictConfig,
+    ep_count: np.ndarray,
+    log_this_step: bool,
+    cfg: DictConfig,
+):
+    if global_step <= seed_steps:
+        action = env.action_space.sample()
+    else:
+        rng, action_key = jax.random.split(rng)
+        action, plan = agent.act(
+            observation,
+            prev_plan=plan,
+            deterministic=False,
+            train=True,
+            key=action_key,
+        )
+        action = np.array(action)
+
+    next_observation, reward, terminated, truncated, info = env.step(action)
+
+    if np.any(~done):
+        replay_buffer.insert(
+            dict(
+                observation=observation,
+                action=action,
+                reward=reward,
+                next_observation=next_observation,
+                terminated=terminated,
+                truncated=truncated,
+            ),
+            mask=~done,
+        )
+    observation = next_observation
+
+    # Handle terminations/truncations
+    done = np.logical_or(terminated, truncated)
+    if np.any(done):
+        if plan is not None:
+            plan = (
+                plan[0].at[done].set(0),
+                plan[1].at[done].set(agent.max_plan_std),
+            )
+        for ienv in range(env_config.num_envs):
+            if done[ienv]:
+                r = info["episode"]["r"][ienv]
+                l = info["episode"]["l"][ienv]
+                print(f"Episode {ep_count[ienv]}: r = {r:.2f}, l = {l}")
+                # writer.scalar("episode/return", r, global_step + ienv)
+                # writer.scalar("episode/length", l, global_step + ienv)
+                ep_count[ienv] += 1
+    all_train_info = defaultdict(list)
+    if global_step >= seed_steps:
+        if global_step == seed_steps:
+            print("Pre-training on seed data...")
+            num_updates = seed_steps
+        else:
+            num_updates = max(1, int(env_config.num_envs * env_config.utd_ratio))
+
+        rng, *update_keys = jax.random.split(rng, num_updates + 1)
+
+        for iupdate in range(num_updates):
+            batch = replay_buffer.sample(agent.batch_size, agent.horizon)
+            assert isinstance(batch, dict)
+            agent, train_info = agent.update(
+                observations=batch["observation"],
+                actions=batch["action"],
+                rewards=batch["reward"],
+                next_observations=batch["next_observation"],
+                terminated=batch["terminated"],
+                truncated=batch["truncated"],
+                key=update_keys[iupdate],
+            )
+            if log_this_step:
+                for k, v in train_info.items():
+                    all_train_info[k].append(np.array(v))
+    return agent, observation, plan, done, replay_buffer, rng, all_train_info
 
 
 if __name__ == "__main__":

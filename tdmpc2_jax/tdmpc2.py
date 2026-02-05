@@ -9,6 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 from flax import struct
+from flax.core.frozen_dict import FrozenDict
 from jaxtyping import PRNGKeyArray, PyTree
 
 from tdmpc2_jax.common.loss import soft_crossentropy
@@ -128,7 +129,7 @@ class TDMPC2(struct.PyTreeNode):
         self,
         z: jax.Array,
         horizon: int,
-        prev_plan: Tuple[jax.Array, jax.Array] = None,
+        prev_plan: Tuple[jax.Array, jax.Array] | None = None,
         deterministic: bool = False,
         train: bool = False,
         *,
@@ -262,11 +263,11 @@ class TDMPC2(struct.PyTreeNode):
         world_model_key, policy_key = jax.random.split(key, 2)
 
         def world_model_loss_fn(
-            encoder_params: flax.core.FrozenDict,
-            dynamics_params: flax.core.FrozenDict,
-            value_params: flax.core.FrozenDict,
-            reward_params: flax.core.FrozenDict,
-            continue_params: flax.core.FrozenDict,
+            encoder_params: FrozenDict,
+            dynamics_params: FrozenDict,
+            value_params: FrozenDict,
+            reward_params: FrozenDict,
+            continue_params: FrozenDict,
         ) -> Tuple[jax.Array, Dict[str, Any]]:
             encoder_key, value_key = jax.random.split(world_model_key, 2)
             lam = self.rho ** jnp.arange(self.horizon)
