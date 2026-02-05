@@ -1,0 +1,37 @@
+[project]
+name = "tdmpc2-jax"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "einops>=0.8.2",
+    "flax>=0.12.3",
+    "gymnasium[mujoco]>=1.2.3",
+    "hydra-core>=1.3.2",
+    "jax[cuda12]>=0.9.0",
+    "jaxtyping>=0.3.7",
+    "numpy>=2.3.5",
+    "optax>=0.2.6",
+    "orbax-checkpoint>=0.11.32",
+    # "tensorboard>=2.20.0",
+    # "tensorflow>=2.20.0",
+    "tqdm>=4.67.3",
+    # "distrax>=0.1.7",
+    # NOTE: Distrax does a poor job of listing the fact that it actually depends on tensorflow-probability, which itself does a terrible job and
+    # doesn't list that it itself depends on tf-keras.
+    # "tensorflow-probability>=0.25.0",
+    # "tf-keras>=2.20.1",
+    # "dm-env>=1.6",
+    # "dm-control>=0.0.319497192",
+]
+
+[tool.uv]
+no-build-package = ["dm_control", "labmaze"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["tdmpc2_jax"]
