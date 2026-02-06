@@ -227,7 +227,6 @@ def train(cfg: DictConfig):
                     writer.add_scalar(f"train/{k}_std", np.std(v), global_step)
                 #     pass
             # pbar.update(env_config.num_envs)
-        pbar.close()
 
 
 def make_env(env_config: DictConfig, seed: int):
@@ -337,7 +336,7 @@ def step[ObsType](
     all_train_info = defaultdict(list)
     if global_step >= seed_steps:
         if global_step == seed_steps:
-            print("Pre-training on seed data...")
+            print(f"Pre-training on seed data for {seed_steps} updates..")
             num_updates = seed_steps
         else:
             num_updates = max(1, int(env_config.num_envs * env_config.utd_ratio))
@@ -383,7 +382,7 @@ def updates(agent: TDMPC2, samples: jax.Array, update_keys: jax.Array):
     return agent, all_train_info
 
 
-@jax.jit
+@jax.jit(donate_argnums=(0,))
 def update(agent: TDMPC2, batch_and_key: tuple[dict, jax.Array]):
     batch, key = batch_and_key
     next_agent, train_info = agent.update(
