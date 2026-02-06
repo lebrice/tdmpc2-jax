@@ -325,14 +325,16 @@ def step[ObsType](
                 plan[0].at[done].set(0),
                 plan[1].at[done].set(agent.max_plan_std),
             )
-        for ienv in range(env_config.num_envs):
-            if done[ienv]:
-                r = info["episode"]["r"][ienv]
-                l = info["episode"]["l"][ienv]
-                print(f"Episode {ep_count[ienv]}: r = {r:.2f}, l = {l}")
+        for env_index, done in enumerate(done):
+            if done:
+                reward = info["episode"]["r"][env_index]
+                length = info["episode"]["l"][env_index]
+                print(
+                    f"Episode {ep_count[env_index]}: reward={reward:.2f}, length={length}"
+                )
                 # writer.scalar("episode/return", r, global_step + ienv)
                 # writer.scalar("episode/length", l, global_step + ienv)
-                ep_count[ienv] += 1
+                ep_count[env_index] += 1
     all_train_info = defaultdict(list)
     if global_step >= seed_steps:
         if global_step == seed_steps:
@@ -342,41 +344,25 @@ def step[ObsType](
             num_updates = max(1, int(env_config.num_envs * env_config.utd_ratio))
 
         rng, *update_keys = jax.random.split(rng, num_updates + 1)
+        update_keys = jax.numpy.stack(update_keys)
 
         # IDEA: Sample all the batches, and pass those to a jitted + scanned update function.
-
         samples = tree_stack(
             [
                 replay_buffer.sample(agent.batch_size, agent.horizon)
                 for _ in range(num_updates)
             ]
         )
-        agent, all_train_info = updates(agent, samples, jax.numpy.stack(update_keys))
-
-        # for iupdate in range(num_updates):
-        #     batch = replay_buffer.sample(agent.batch_size, agent.horizon)
-        #     assert isinstance(batch, dict)
-        #     agent, train_info = agent.update(
-        #         observations=batch["observation"],
-        #         actions=batch["action"],
-        #         rewards=batch["reward"],
-        #         next_observations=batch["next_observation"],
-        #         terminated=batch["terminated"],
-        #         truncated=batch["truncated"],
-        #         key=update_keys[iupdate],
-        #     )
-        #     if log_this_step:
-        #         for k, v in train_info.items():
-        #             all_train_info[k].append(jnp.array(v))
+        agent, all_train_info = updates(agent, samples, update_keys)
     return rng, agent, observation, plan, done, replay_buffer, all_train_info
 
 
-@jax.jit
+@jax.jit(donate_argnums=(0,))
 def updates(agent: TDMPC2, samples: jax.Array, update_keys: jax.Array):
     agent, all_train_info = jax.lax.scan(
         update,
         init=agent,
-        xs=(samples, jax.numpy.stack(update_keys)),
+        xs=(samples, update_keys),
         # length=num_updates,
     )
     return agent, all_train_info
