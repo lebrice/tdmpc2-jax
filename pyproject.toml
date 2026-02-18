@@ -29,6 +29,9 @@ dependencies = [
     # TODO: Look into mujoco-playground for the environment.
     # "mujoco-warp>=0.0.2",
     # "playground>=0.1.0",
+    "playground>=0.1.0",
+    "tensorboard>=2.20.0",
+    "dm-control>=0.0.319497192",
 ]
 
 [tool.uv]

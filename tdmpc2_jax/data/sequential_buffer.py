@@ -1,6 +1,7 @@
 from typing import Literal, Mapping, overload
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 
 # TODO: Reuse the buffers from soem other library?
@@ -39,14 +40,14 @@ class SequentialReplayBuffer[T: Mapping]:
         self.current_ind = np.zeros(num_envs, dtype=int)
 
         self.data = jax.tree.map(
-            lambda x: np.zeros(
-                (self.capacity,) + np.asarray(x).shape, np.asarray(x).dtype
+            lambda x: jnp.zeros(
+                (self.capacity,) + jnp.asarray(x).shape, jnp.asarray(x).dtype
             ),
             dummy_input,
         )
         self.np_random = np.random.default_rng(seed=seed)
 
-    def insert(self, data: T, mask: np.ndarray | None = None) -> None:
+    def insert(self, data: T, mask: np.ndarray | jax.Array | None = None) -> None:
         """
         Insert data into the buffer
 
@@ -59,14 +60,14 @@ class SequentialReplayBuffer[T: Mapping]:
         """
         # Insert data for the specified envs
         if mask is None:
-            mask = np.ones(self.num_envs, dtype=bool)
+            mask = jnp.ones(self.num_envs, dtype=bool)
 
         if self.vectorized:
 
-            def masked_set(x, y):
-                x[self.current_ind, mask] = y[mask]
+            def masked_set(x: jax.Array, y: jax.Array):
+                return x.at[self.current_ind, mask].set(y[mask])
 
-            jax.tree.map(masked_set, self.data, data)
+            self.data = jax.tree.map(masked_set, self.data, data)
         else:
             jax.tree.map(
                 lambda x, y: x.__setitem__(self.current_ind, y), self.data, data
